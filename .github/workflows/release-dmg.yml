@@ -2,14 +2,18 @@ name: Build DMG
 
 # Build distributable DMGs for both Apple Silicon (arm64) and Intel (x86_64).
 #
-#  - Push to main / manual run: builds UNSIGNED DMGs and uploads them as
-#    workflow-run artifacts (no secrets required, Gatekeeper will warn users).
-#  - Push a version tag (vX.Y.Z): builds DMGs SIGNED with Developer ID, notarizes
-#    and staples them, then generates a Sparkle-signed appcast and publishes the
-#    DMGs + appcast.xml to a GitHub Release. This is what makes both the privileged
-#    helper (SMAppService) and Sparkle auto-update actually work for end users.
+# The pipeline degrades gracefully depending on which secrets are configured:
 #
-# Required repository secrets for the signed/tagged path:
+#  - No signing secrets (default): builds UNSIGNED DMGs. Pushes to main upload
+#    them as workflow-run artifacts; tags publish them to a GitHub *prerelease*
+#    (Gatekeeper will warn users; the helper + auto-update stay inert).
+#  - Signing secrets present: builds Developer ID-SIGNED DMGs, and on a tag also
+#    notarizes + staples them, generates a Sparkle-signed appcast, and publishes
+#    everything to a GitHub Release. This is what makes the privileged helper
+#    (SMAppService) and Sparkle auto-update work for end users.
+#
+# Optional repository secrets (add them when you have a paid Apple Developer
+# account + Sparkle keys — the pipeline picks them up automatically):
 #   DEVELOPER_ID_APPLICATION_CERT   base64 of your Developer ID Application .p12
 #   DEVELOPER_ID_CERT_PASSWORD      password for that .p12
 #   APPLE_TEAM_ID                   your 10-char Apple Developer Team ID
@@ -35,6 +39,8 @@ jobs:
     runs-on: macos-14
     env:
       IS_RELEASE: ${{ startsWith(github.ref, 'refs/tags/v') }}
+      # True only when a Developer ID cert secret is configured.
+      HAS_SIGNING: ${{ secrets.DEVELOPER_ID_APPLICATION_CERT != '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -54,11 +60,11 @@ jobs:
       - name: Show build environment
         run: |
           xcodebuild -version
-          echo "Building for arch: ${{ matrix.arch }} (release=$IS_RELEASE)"
+          echo "arch=${{ matrix.arch }} release=$IS_RELEASE signing=$HAS_SIGNING"
 
-      # ---- Signed (tagged) path: import the Developer ID cert ----
+      # ---- Signed path (only when signing secrets are configured) ----
       - name: Import Developer ID certificate
-        if: env.IS_RELEASE == 'true'
+        if: env.HAS_SIGNING == 'true'
         env:
           CERT_B64: ${{ secrets.DEVELOPER_ID_APPLICATION_CERT }}
           CERT_PASSWORD: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD }}
@@ -78,7 +84,7 @@ jobs:
           rm -f "$RUNNER_TEMP/cert.p12"
 
       - name: Build Owlet (Release, signed, ${{ matrix.arch }})
-        if: env.IS_RELEASE == 'true'
+        if: env.HAS_SIGNING == 'true'
         run: |
           set -euo pipefail
           xcodebuild \
@@ -96,8 +102,9 @@ jobs:
             OTHER_CODE_SIGN_FLAGS="--timestamp" \
             clean build
 
+      # ---- Unsigned path (default, no secrets required) ----
       - name: Build Owlet (Release, unsigned, ${{ matrix.arch }})
-        if: env.IS_RELEASE != 'true'
+        if: env.HAS_SIGNING != 'true'
         run: |
           set -euo pipefail
           xcodebuild \
@@ -125,8 +132,8 @@ jobs:
           lipo -archs "$BIN"
           lipo -archs "$BIN" | grep -qw '${{ matrix.arch }}'
 
-      - name: Verify signing (release only)
-        if: env.IS_RELEASE == 'true'
+      - name: Verify signing (signed builds only)
+        if: env.HAS_SIGNING == 'true'
         run: |
           set -euo pipefail
           APP="build/Build/Products/Release/Owlet.app"
@@ -156,8 +163,8 @@ jobs:
           echo "Artifacts:"
           ls -lh dist
 
-      - name: Sign, notarize and staple DMG (release only)
-        if: env.IS_RELEASE == 'true'
+      - name: Sign, notarize and staple DMG (signed releases only)
+        if: env.IS_RELEASE == 'true' && env.HAS_SIGNING == 'true'
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
@@ -183,12 +190,15 @@ jobs:
           path: dist/*.dmg
           if-no-files-found: error
 
-  # ---- Tagged releases: build the signed appcast and publish everything ----
+  # ---- Tagged releases: publish DMGs (+ signed appcast when keys are present) ----
   release:
-    name: Publish Release + Appcast
+    name: Publish Release
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: macos-14
+    env:
+      HAS_SIGNING: ${{ secrets.DEVELOPER_ID_APPLICATION_CERT != '' }}
+      HAS_SPARKLE: ${{ secrets.SPARKLE_PRIVATE_KEY != '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -203,8 +213,10 @@ jobs:
           merge-multiple: true
           path: dist
 
+      # ---- Appcast (only when a Sparkle private key is configured) ----
       - name: Locate Sparkle tools
         id: sparkle
+        if: env.HAS_SPARKLE == 'true'
         run: |
           set -euo pipefail
           # Resolve the exact pinned Sparkle version and find its bundled tools.
@@ -219,6 +231,7 @@ jobs:
           echo "Found: $GEN"
 
       - name: Generate signed appcast
+        if: env.HAS_SPARKLE == 'true'
         env:
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: |
@@ -234,9 +247,18 @@ jobs:
           echo "Generated appcast:"
           cat dist/appcast.xml
 
-      - name: Publish to GitHub Release
+      # ---- Publish ----
+      - name: Publish DMGs to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            dist/*.dmg
-            dist/appcast.xml
+          # Unsigned builds are marked as prereleases so they don't become the
+          # "latest" release that the Sparkle feed URL resolves to.
+          prerelease: ${{ env.HAS_SIGNING != 'true' }}
+          body: ${{ env.HAS_SIGNING == 'true' && 'Signed and notarized build.' || 'Unsigned build — macOS Gatekeeper will warn. Right-click the app and choose Open (or approve it in System Settings > Privacy & Security) to run it. The background helper and auto-update require a signed release.' }}
+          files: dist/*.dmg
+
+      - name: Attach appcast (signed releases only)
+        if: env.HAS_SPARKLE == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/appcast.xml
