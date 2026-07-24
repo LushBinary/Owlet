@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+
+	<!-- Run as a UI agent: no Dock icon, no menu bar app menu, no main window.
+	     This is the key that turns Owlet into a pure menu-bar (status bar) app. -->
+	<key>LSUIElement</key>
+	<true/>
+
+	<!-- Minimum supported OS. Requirement: macOS 13+. -->
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+
+	<!-- We do not ship a main storyboard/nib; the UI is built programmatically. -->
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+
+	<key>NSHumanReadableCopyright</key>
+	<string></string>
+</dict>
+</plist>
