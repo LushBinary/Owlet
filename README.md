@@ -25,7 +25,7 @@ Owlet uses IOKit power assertions to block idle sleep (like the classic "caffein
 ## Requirements
 
 - macOS 13 (Ventura) or later
-- Xcode 16 or later (the project uses the `objectVersion 77` format and a Swift Package dependency; developed against Xcode 26)
+- Xcode 16.1 or later (the project uses the `objectVersion 77` project format and a Swift Package dependency; developed against Xcode 26)
 - An admin account (clamshell mode needs root to change `disablesleep`)
 
 ## Who needs an Apple Developer account?
