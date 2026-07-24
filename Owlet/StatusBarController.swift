@@ -129,6 +129,16 @@ final class StatusBarController: NSObject {
         timerParent.submenu = timerMenu
         menu.addItem(timerParent)
 
+        // "Allow Display to Sleep" — when checked, Keep Awake holds only the
+        // system assertion so the screen can still turn off to save power.
+        let displaySleep = NSMenuItem(title: "Allow Display to Sleep",
+                                      action: #selector(toggleAllowDisplaySleep),
+                                      keyEquivalent: "")
+        displaySleep.target = self
+        displaySleep.state = power.allowDisplaySleep ? .on : .off
+        displaySleep.toolTip = Help.allowDisplaySleep
+        menu.addItem(displaySleep)
+
         menu.addItem(.separator())
 
         // Clamshell toggle.
@@ -169,11 +179,30 @@ final class StatusBarController: NSObject {
         login.toolTip = Help.launchAtLogin
         menu.addItem(login)
 
+        // Unattended auto-revert helper (privileged daemon). When enabled, timed
+        // and battery-triggered clamshell reverts happen silently (no password).
+        let helper = NSMenuItem(title: "Unattended Auto-Revert (Helper)",
+                                action: #selector(toggleHelper),
+                                keyEquivalent: "")
+        helper.target = self
+        helper.state = PrivilegedHelper.isEnabled ? .on : .off
+        helper.toolTip = Help.helper
+        menu.addItem(helper)
+
         // Inline help: expands into the full description of every feature + risks.
         let help = NSMenuItem(title: "What do these do?", action: #selector(showHelp), keyEquivalent: "")
         help.target = self
         help.toolTip = "Show a full explanation of each feature and its risks."
         menu.addItem(help)
+
+        // Check for app updates via Sparkle.
+        let update = NSMenuItem(title: "Check for Updates…",
+                                action: #selector(checkForUpdates),
+                                keyEquivalent: "")
+        update.target = self
+        update.isEnabled = Updater.shared.canCheckForUpdates
+        update.toolTip = "Look for a newer version of Owlet and install it."
+        menu.addItem(update)
 
         menu.addItem(.separator())
 
@@ -209,6 +238,8 @@ final class StatusBarController: NSObject {
 
     @objc private func toggleClamshell() {
         let turningOn = !power.isClamshellActive
+        // Warn before enabling lid-closed mode on battery (heat/airflow + drain).
+        if turningOn && !confirmClamshellOnBatteryIfNeeded() { return }
         power.setClamshell(turningOn) { [weak self] result in
             switch result {
             case .success, .cancelled:
@@ -237,11 +268,37 @@ final class StatusBarController: NSObject {
                 if case .failed(let message) = result { self?.presentError(message) }
             }
         } else {
+            // Warn before enabling lid-closed mode on battery (heat/airflow + drain).
+            if !confirmClamshellOnBatteryIfNeeded() { return }
             // Enables clamshell (prompts for admin) and schedules the auto-revert.
             power.setClamshell(true, duration: duration) { [weak self] result in
                 if case .failed(let message) = result { self?.presentError(message) }
             }
         }
+    }
+
+    /// If the Mac is on battery, warn about the thermal/drain risk of lid-closed
+    /// mode and let the user decide. Returns true to proceed, false to abort.
+    /// Always returns true when on AC power (or when the state is unknown).
+    private func confirmClamshellOnBatteryIfNeeded() -> Bool {
+        guard !PowerManager.isOnACPower() else { return true }
+        let alert = NSAlert()
+        alert.messageText = "Your Mac is on battery"
+        alert.informativeText = """
+        Lid-closed (clamshell) mode is meant for AC power. On battery the Mac \
+        loses its main airflow path with the lid shut and can overheat, and it \
+        will keep draining with no way to sleep. Owlet will automatically turn \
+        clamshell off if you unplug later. Enable it anyway?
+        """
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Enable Anyway")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    @objc private func toggleAllowDisplaySleep() {
+        power.allowDisplaySleep.toggle()
     }
 
     @objc private func toggleLaunchAtLogin() {
@@ -258,6 +315,33 @@ final class StatusBarController: NSObject {
             alert.runModal()
         }
         refresh()
+    }
+
+    @objc private func toggleHelper() {
+        if PrivilegedHelper.isEnabled {
+            if let error = PrivilegedHelper.unregister() { presentError(error) }
+        } else {
+            if let error = PrivilegedHelper.register() {
+                presentError(error)
+            } else if PrivilegedHelper.requiresApproval {
+                let alert = NSAlert()
+                alert.messageText = "Approve the Owlet helper"
+                alert.informativeText = """
+                macOS needs you to allow Owlet's background helper under \
+                System Settings > General > Login Items. Once approved, timed and \
+                on-battery clamshell reverts happen automatically without a password.
+                """
+                alert.alertStyle = .informational
+                alert.addButton(withTitle: "OK")
+                NSApp.activate(ignoringOtherApps: true)
+                alert.runModal()
+            }
+        }
+        refresh()
+    }
+
+    @objc private func checkForUpdates() {
+        Updater.shared.checkForUpdates()
     }
 
     @objc private func quit() {
@@ -325,13 +409,21 @@ private enum Help {
     Risks: (1) with the lid closed the Mac loses its main airflow path, so it can run \
     hot under load — keep it on AC power and, ideally, on a hard surface; (2) it's a \
     system-wide setting, not just for Owlet, so nothing will sleep the Mac until it's \
-    turned off. Owlet resets it to normal automatically when you Quit.
+    turned off. For safety Owlet warns if you enable it on battery and automatically \
+    turns it off if you unplug from AC. Owlet also resets it to normal when you Quit.
     """
 
     static let timer = """
     Keep Awake For…: stays awake for the chosen duration, then automatically releases \
     the lock and lets the Mac sleep normally. "Indefinitely" stays awake until you turn \
     it off or Quit. Risk: none — this only controls the Keep Awake assertion.
+    """
+
+    static let allowDisplaySleep = """
+    Allow Display to Sleep: when checked, Keep Awake stops only the system from \
+    sleeping and lets the display turn off normally — handy for long downloads or \
+    renders where you don't need the screen. Unchecked (default), both the system \
+    and the display stay awake. Takes effect immediately, even mid-session.
     """
 
     static let clamshellTimer = """
@@ -347,6 +439,14 @@ private enum Help {
     System Settings > General > Login Items.
     """
 
+    static let helper = """
+    Unattended Auto-Revert (Helper): installs a small background helper that can \
+    turn clamshell mode off on its own — so timed reverts and the on-battery safety \
+    revert work even when you're away, with no admin password prompt. macOS asks you \
+    to approve it once under Login Items. Without it, Owlet still reverts clamshell, \
+    but each revert needs your password. (Requires a properly signed build.)
+    """
+
     static let quit = """
     Quit Owlet: releases all keep-awake locks and restores normal sleep behavior \
     (including turning clamshell mode back off) before the app exits.
@@ -359,6 +459,9 @@ private enum Help {
     KEEP AWAKE FOR…
     \(timer)
 
+    ALLOW DISPLAY TO SLEEP
+    \(allowDisplaySleep)
+
     ALLOW LID-CLOSED (CLAMSHELL) MODE
     \(clamshell)
 
@@ -367,6 +470,9 @@ private enum Help {
 
     LAUNCH AT LOGIN
     \(launchAtLogin)
+
+    UNATTENDED AUTO-REVERT (HELPER)
+    \(helper)
 
     QUIT
     \(quit)

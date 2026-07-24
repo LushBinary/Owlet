@@ -19,6 +19,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Belt-and-suspenders alongside LSUIElement: no Dock icon, no app menu.
         NSApp.setActivationPolicy(.accessory)
 
+        // Ask for notification permission and register the banner presenter so we
+        // can tell the user when timers fire or clamshell auto-reverts.
+        Notifier.shared.start()
+
+        // Start Sparkle's updater so scheduled update checks begin.
+        _ = Updater.shared
+
         // Build the menu-bar UI.
         statusBar = StatusBarController(power: power)
 

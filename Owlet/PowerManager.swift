@@ -15,6 +15,7 @@
 
 import Foundation
 import IOKit.pwr_mgt
+import IOKit.ps
 import os
 
 /// How long a "keep awake" session should last before auto-releasing.
@@ -37,6 +38,15 @@ enum ClamshellResult {
     case success
     case cancelled          // user dismissed the admin password prompt
     case failed(String)     // any other failure, with a message
+}
+
+/// C callback for IOKit power-source change notifications. Runs on the main run
+/// loop; we hop onto the main actor and forward to the PowerManager instance
+/// passed through as an opaque context pointer.
+private nonisolated func owletPowerSourceChanged(_ context: UnsafeMutableRawPointer?) {
+    guard let context else { return }
+    let manager = Unmanaged<PowerManager>.fromOpaque(context).takeUnretainedValue()
+    Task { @MainActor in manager.powerSourceDidChange() }
 }
 
 @MainActor
@@ -69,6 +79,24 @@ final class PowerManager {
     /// (i.e. left over from a previous session / crash and not set by us).
     var onLeftoverClamshellDetected: (() -> Void)?
 
+    // MARK: - Display-sleep preference (#5)
+
+    private let allowDisplaySleepKey = "OwletAllowDisplaySleep"
+
+    /// When true, Keep Awake holds only the *system* sleep assertion, letting the
+    /// display turn off normally (useful for downloads/renders where the screen
+    /// isn't needed). When false (default), both system and display stay awake.
+    /// Persisted across launches. Toggling while active reconfigures assertions.
+    var allowDisplaySleep: Bool {
+        get { UserDefaults.standard.bool(forKey: allowDisplaySleepKey) }
+        set {
+            UserDefaults.standard.set(newValue, forKey: allowDisplaySleepKey)
+            // If we're currently awake, add/drop the display assertion to match.
+            if isKeepAwakeActive { createAssertionsIfNeeded() }
+            notifyChange()
+        }
+    }
+
     // MARK: - Private state
 
     /// IOKit assertion IDs. `kIOPMNullAssertionID` (0) means "not held".
@@ -84,6 +112,9 @@ final class PowerManager {
     /// Guards the "leftover clamshell" check so it only fires on the first sync.
     private var didInitialSync = false
 
+    /// Run-loop source for IOKit power-source (AC/battery) change notifications.
+    private var powerSourceRunLoopSource: CFRunLoopSource?
+
     private let log = Logger(subsystem: "com.lushbinary.Owlet", category: "PowerManager")
 
     // MARK: - Lifecycle
@@ -91,6 +122,14 @@ final class PowerManager {
     init() {
         // On launch, read the real system SleepDisabled state so the UI matches reality.
         refreshClamshellStateFromSystem()
+        // Watch for AC/battery transitions so clamshell can auto-revert on battery.
+        startMonitoringPowerSource()
+    }
+
+    deinit {
+        if let source = powerSourceRunLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .defaultMode)
+        }
     }
 
     // MARK: - Keep Awake (IOKit power assertions)
@@ -147,19 +186,25 @@ final class PowerManager {
     private func timerDidExpire() {
         log.info("Keep-awake timer expired; releasing assertions.")
         stopKeepAwake()
+        Notifier.shared.post(title: "Keep Awake ended",
+                             body: "The timer finished — your Mac can sleep normally again.")
     }
 
-    /// Create the two IOKit assertions if we don't already hold them.
+    /// Create (or, for the display assertion, create/release) the IOKit assertions
+    /// to match the current `allowDisplaySleep` preference.
     ///
     /// `IOPMAssertionCreateWithName` registers a named assertion with the power
     /// management subsystem. While the assertion is held the system will not
-    /// enter the corresponding idle-sleep state. We hold two:
-    ///   - kIOPMAssertionTypePreventUserIdleSystemSleep: the machine won't idle-sleep.
-    ///   - kIOPMAssertionTypePreventUserIdleDisplaySleep: the display won't sleep,
-    ///     which also implicitly keeps the system awake.
+    /// enter the corresponding idle-sleep state. We may hold up to two:
+    ///   - kIOPMAssertionTypePreventUserIdleSystemSleep: the machine won't idle-sleep
+    ///     (always held while Keep Awake is active).
+    ///   - kIOPMAssertionTypePreventUserIdleDisplaySleep: the display won't sleep;
+    ///     held only when `allowDisplaySleep` is false. When the user opts to let the
+    ///     display sleep, this assertion is released (or never created).
     private func createAssertionsIfNeeded() {
         let reason = "Owlet keeping the Mac awake" as CFString
 
+        // System idle sleep is always blocked while Keep Awake is active.
         if systemSleepAssertionID == IOPMAssertionID(kIOPMNullAssertionID) {
             var id = IOPMAssertionID(kIOPMNullAssertionID)
             let result = IOPMAssertionCreateWithName(
@@ -174,7 +219,14 @@ final class PowerManager {
             }
         }
 
-        if displaySleepAssertionID == IOPMAssertionID(kIOPMNullAssertionID) {
+        // Display sleep is blocked only when the user hasn't opted to allow it.
+        if allowDisplaySleep {
+            // Drop the display assertion if we happen to hold it.
+            if displaySleepAssertionID != IOPMAssertionID(kIOPMNullAssertionID) {
+                IOPMAssertionRelease(displaySleepAssertionID)
+                displaySleepAssertionID = IOPMAssertionID(kIOPMNullAssertionID)
+            }
+        } else if displaySleepAssertionID == IOPMAssertionID(kIOPMNullAssertionID) {
             var id = IOPMAssertionID(kIOPMNullAssertionID)
             let result = IOPMAssertionCreateWithName(
                 kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
@@ -188,8 +240,8 @@ final class PowerManager {
             }
         }
 
-        isKeepAwakeActive = (systemSleepAssertionID != IOPMAssertionID(kIOPMNullAssertionID))
-            || (displaySleepAssertionID != IOPMAssertionID(kIOPMNullAssertionID))
+        // Keep Awake is "active" whenever we hold the system assertion.
+        isKeepAwakeActive = systemSleepAssertionID != IOPMAssertionID(kIOPMNullAssertionID)
     }
 
     /// Release both assertions via `IOPMAssertionRelease`, which tells power
@@ -230,11 +282,8 @@ final class PowerManager {
                       duration: KeepAwakeDuration? = nil,
                       completion: @escaping @MainActor (ClamshellResult) -> Void) {
         let value = enabled ? "1" : "0"
-        // `-a` applies to all power sources. Adjust to `-c` (charger) if you only
-        // want it while plugged in.
-        let shellCommand = "/usr/bin/pmset -a disablesleep \(value)"
 
-        runWithAdminPrivileges(shellCommand) { [weak self] result in
+        applyPrivilegedClamshell(enabled, value: value) { [weak self] result in
             guard let self else { return }
             switch result {
             case .success:
@@ -255,6 +304,23 @@ final class PowerManager {
                 completion(.failed(message))
             }
             self.notifyChange()
+        }
+    }
+
+    /// Apply the privileged `disablesleep` change, preferring the installed helper
+    /// daemon (silent, no prompt) and falling back to an `osascript` admin prompt
+    /// when the helper isn't available (unsigned builds, or not yet installed).
+    private func applyPrivilegedClamshell(_ enabled: Bool,
+                                          value: String,
+                                          completion: @escaping @MainActor (ClamshellResult) -> Void) {
+        Task { @MainActor in
+            if let helperResult = await PrivilegedHelper.setClamshell(enabled) {
+                completion(helperResult)
+                return
+            }
+            // No helper: fall back to the admin-prompt path.
+            // `-a` applies to all power sources; adjust to `-c` for charger-only.
+            self.runWithAdminPrivileges("/usr/bin/pmset -a disablesleep \(value)", completion: completion)
         }
     }
 
@@ -291,10 +357,19 @@ final class PowerManager {
 
     private func clamshellTimerDidExpire() {
         log.info("Clamshell auto-revert timer expired; resetting disablesleep.")
-        // NOTE: reverting needs root, so this will present an admin prompt. If the
-        // Mac is unattended (or lid-closed with no external display), the prompt
-        // may go unanswered until someone returns — clamshell stays on until then.
-        setClamshell(false) { _ in }
+        // Reverting needs root. If the privileged helper is installed the revert is
+        // silent; otherwise this presents an admin prompt and, on an unattended Mac,
+        // clamshell stays on until someone confirms it.
+        setClamshell(false) { result in
+            switch result {
+            case .success:
+                Notifier.shared.post(title: "Clamshell timer ended",
+                                     body: "Lid-closed mode was turned off and normal sleep restored.")
+            case .cancelled, .failed:
+                Notifier.shared.post(title: "Clamshell still on",
+                                     body: "The auto-revert needs your admin password. Open Owlet to turn it off.")
+            }
+        }
     }
 
     /// Read the real `SleepDisabled` value from `pmset -g` (no privileges needed)
@@ -317,6 +392,51 @@ final class PowerManager {
                 if isFirstSync && disabled {
                     self.onLeftoverClamshellDetected?()
                 }
+            }
+        }
+    }
+
+    // MARK: - Power source (AC / battery) awareness (#1)
+
+    /// Called on the main actor when clamshell was auto-reverted because the Mac
+    /// switched to battery power (a safety measure against overheating/drain).
+    var onClamshellRevertedOnBattery: (() -> Void)?
+
+    /// True if the Mac is currently drawing from AC (wall) power. Desktops with no
+    /// battery report AC. Defaults to `true` if the state can't be determined, so
+    /// we never spuriously block clamshell on machines without a battery.
+    nonisolated static func isOnACPower() -> Bool {
+        guard let blob = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+              let type = IOPSGetProvidingPowerSourceType(blob)?.takeRetainedValue() as String?
+        else { return true }
+        return type == kIOPSACPowerValue
+    }
+
+    /// Register a run-loop source that fires whenever the power source changes.
+    private func startMonitoringPowerSource() {
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        guard let source = IOPSNotificationCreateRunLoopSource(owletPowerSourceChanged, context)?
+            .takeRetainedValue() else {
+            log.error("Failed to create power-source run-loop source.")
+            return
+        }
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .defaultMode)
+        powerSourceRunLoopSource = source
+    }
+
+    /// Handle an AC/battery transition. If clamshell is on and we've dropped to
+    /// battery, auto-revert it for safety (heat/airflow with the lid shut) and
+    /// notify the user.
+    func powerSourceDidChange() {
+        guard isClamshellActive, !Self.isOnACPower() else { return }
+        log.info("Switched to battery while clamshell active; auto-reverting for safety.")
+        setClamshell(false) { [weak self] result in
+            guard let self else { return }
+            if case .success = result {
+                self.onClamshellRevertedOnBattery?()
+                Notifier.shared.post(
+                    title: "Clamshell turned off",
+                    body: "Your Mac is on battery, so lid-closed mode was disabled to avoid overheating.")
             }
         }
     }

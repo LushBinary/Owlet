@@ -1,8 +1,21 @@
 name: Build DMG
 
-# Build distributable DMGs for both Apple Silicon (arm64) and Intel (x86_64)
-# whenever code lands on main. Artifacts are attached to the workflow run and,
-# when the push is a version tag (vX.Y.Z), published as a GitHub Release.
+# Build distributable DMGs for both Apple Silicon (arm64) and Intel (x86_64).
+#
+#  - Push to main / manual run: builds UNSIGNED DMGs and uploads them as
+#    workflow-run artifacts (no secrets required, Gatekeeper will warn users).
+#  - Push a version tag (vX.Y.Z): builds DMGs SIGNED with Developer ID, notarizes
+#    and staples them, then generates a Sparkle-signed appcast and publishes the
+#    DMGs + appcast.xml to a GitHub Release. This is what makes both the privileged
+#    helper (SMAppService) and Sparkle auto-update actually work for end users.
+#
+# Required repository secrets for the signed/tagged path:
+#   DEVELOPER_ID_APPLICATION_CERT   base64 of your Developer ID Application .p12
+#   DEVELOPER_ID_CERT_PASSWORD      password for that .p12
+#   APPLE_TEAM_ID                   your 10-char Apple Developer Team ID
+#   APPLE_ID                        Apple ID email used for notarization
+#   APPLE_APP_SPECIFIC_PASSWORD     app-specific password for that Apple ID
+#   SPARKLE_PRIVATE_KEY             base64 EdDSA private key from Sparkle generate_keys
 on:
   push:
     branches: [main]
@@ -20,6 +33,8 @@ jobs:
   build:
     name: Build ${{ matrix.arch }} DMG
     runs-on: macos-14
+    env:
+      IS_RELEASE: ${{ startsWith(github.ref, 'refs/tags/v') }}
     strategy:
       fail-fast: false
       matrix:
@@ -39,9 +54,50 @@ jobs:
       - name: Show build environment
         run: |
           xcodebuild -version
-          echo "Building for arch: ${{ matrix.arch }}"
+          echo "Building for arch: ${{ matrix.arch }} (release=$IS_RELEASE)"
 
-      - name: Build Owlet (Release, ${{ matrix.arch }})
+      # ---- Signed (tagged) path: import the Developer ID cert ----
+      - name: Import Developer ID certificate
+        if: env.IS_RELEASE == 'true'
+        env:
+          CERT_B64: ${{ secrets.DEVELOPER_ID_APPLICATION_CERT }}
+          CERT_PASSWORD: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PW="$(openssl rand -base64 24)"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          echo "$CERT_B64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PW" "$KEYCHAIN"
+          # Put our keychain first in the search list so codesign can find the identity.
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Build Owlet (Release, signed, ${{ matrix.arch }})
+        if: env.IS_RELEASE == 'true'
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project Owlet.xcodeproj \
+            -scheme Owlet \
+            -configuration Release \
+            -derivedDataPath build \
+            -destination 'generic/platform=macOS' \
+            ARCHS='${{ matrix.arch }}' \
+            VALID_ARCHS='${{ matrix.arch }}' \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="Developer ID Application" \
+            DEVELOPMENT_TEAM="${{ secrets.APPLE_TEAM_ID }}" \
+            OTHER_CODE_SIGN_FLAGS="--timestamp" \
+            clean build
+
+      - name: Build Owlet (Release, unsigned, ${{ matrix.arch }})
+        if: env.IS_RELEASE != 'true'
         run: |
           set -euo pipefail
           xcodebuild \
@@ -69,6 +125,18 @@ jobs:
           lipo -archs "$BIN"
           lipo -archs "$BIN" | grep -qw '${{ matrix.arch }}'
 
+      - name: Verify signing (release only)
+        if: env.IS_RELEASE == 'true'
+        run: |
+          set -euo pipefail
+          APP="build/Build/Products/Release/Owlet.app"
+          echo "App signature:"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          echo "Embedded helper signature:"
+          codesign --verify --strict --verbose=2 "$APP/Contents/MacOS/OwletHelper"
+          echo "Sparkle framework signature:"
+          codesign --verify --strict --verbose=2 "$APP/Contents/Frameworks/Sparkle.framework"
+
       - name: Read app version
         id: version
         run: |
@@ -88,6 +156,26 @@ jobs:
           echo "Artifacts:"
           ls -lh dist
 
+      - name: Sign, notarize and staple DMG (release only)
+        if: env.IS_RELEASE == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          OUT="dist/Owlet-${{ steps.version.outputs.version }}-${{ matrix.label }}.dmg"
+          # Sign the disk image itself with the same Developer ID identity.
+          codesign --force --timestamp --sign "Developer ID Application" "$OUT"
+          # Notarize and wait for the result, then staple the ticket into the DMG.
+          xcrun notarytool submit "$OUT" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --wait
+          xcrun stapler staple "$OUT"
+          xcrun stapler validate "$OUT"
+
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
         with:
@@ -95,8 +183,60 @@ jobs:
           path: dist/*.dmg
           if-no-files-found: error
 
+  # ---- Tagged releases: build the signed appcast and publish everything ----
+  release:
+    name: Publish Release + Appcast
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -switch /Applications/Xcode.app
+
+      - name: Download DMG artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: Owlet-*-dmg
+          merge-multiple: true
+          path: dist
+
+      - name: Locate Sparkle tools
+        id: sparkle
+        run: |
+          set -euo pipefail
+          # Resolve the exact pinned Sparkle version and find its bundled tools.
+          xcodebuild -project Owlet.xcodeproj -resolvePackageDependencies \
+            -clonedSourcePackagesDirPath spm
+          GEN=$(find spm -type f -name generate_appcast | head -1)
+          if [[ -z "$GEN" ]]; then
+            echo "error: generate_appcast not found in resolved Sparkle package" >&2
+            exit 1
+          fi
+          echo "generate_appcast=$GEN" >> "$GITHUB_OUTPUT"
+          echo "Found: $GEN"
+
+      - name: Generate signed appcast
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          GEN='${{ steps.sparkle.outputs.generate_appcast }}'
+          PREFIX="${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}/"
+          # Feed the EdDSA private key via stdin (never written to disk).
+          echo "$SPARKLE_PRIVATE_KEY" | "$GEN" \
+            --ed-key-file - \
+            --download-url-prefix "$PREFIX" \
+            -o dist/appcast.xml \
+            dist
+          echo "Generated appcast:"
+          cat dist/appcast.xml
+
       - name: Publish to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.dmg
+          files: |
+            dist/*.dmg
+            dist/appcast.xml

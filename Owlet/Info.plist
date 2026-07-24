@@ -34,5 +34,27 @@
 
 	<key>NSHumanReadableCopyright</key>
 	<string></string>
+
+	<!-- ===== Sparkle auto-update ===== -->
+
+	<!-- The appcast feed. Owlet publishes appcast.xml to its GitHub Releases, so
+	     this stable URL always points at the newest published feed. -->
+	<key>SUFeedURL</key>
+	<string>https://github.com/LushBinary/Owlet/releases/latest/download/appcast.xml</string>
+
+	<!-- EdDSA (ed25519) PUBLIC key used to verify update signatures. This is NOT
+	     an Apple key and needs no Apple account. Generate a keypair once with
+	     Sparkle's `generate_keys` tool; paste the printed PUBLIC key here and keep
+	     the private key in the login keychain / CI secret (SPARKLE_PRIVATE_KEY).
+	     PLACEHOLDER — replace before shipping real updates. -->
+	<key>SUPublicEDKey</key>
+	<string>REPLACE_WITH_YOUR_SPARKLE_ED25519_PUBLIC_KEY</string>
+
+	<!-- Check for updates automatically (the user is asked for consent on first
+	     launch) and no more than once a day. -->
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUScheduledCheckInterval</key>
+	<integer>86400</integer>
 </dict>
 </plist>
