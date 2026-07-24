@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- launchd label; must match the XPC Mach service name and the filename
+	     passed to SMAppService.daemon(plistName:). -->
+	<key>Label</key>
+	<string>com.lushbinary.Owlet.Helper</string>
+
+	<!-- Path to the helper executable, RELATIVE to the app bundle. The app's
+	     build embeds OwletHelper into Contents/MacOS via a Copy Files phase. -->
+	<key>BundleProgram</key>
+	<string>Contents/MacOS/OwletHelper</string>
+
+	<!-- Expose the Mach service the app connects to over XPC. -->
+	<key>MachServices</key>
+	<dict>
+		<key>com.lushbinary.Owlet.Helper</key>
+		<true/>
+	</dict>
+
+	<!-- Ties the daemon to the owning app so SMAppService manages it correctly. -->
+	<key>AssociatedBundleIdentifiers</key>
+	<array>
+		<string>com.lushbinary.Owlet</string>
+	</array>
+</dict>
+</plist>
