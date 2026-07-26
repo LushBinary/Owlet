@@ -22,6 +22,19 @@ Owlet uses IOKit power assertions to block idle sleep (like the classic "caffein
 - Warns and offers to reset clamshell if it was left on from a previous session
 - Cleans up all assertions and resets `disablesleep` on quit
 
+## Download
+
+Grab the latest DMG from the [Owlet releases page](https://github.com/LushBinary/Owlet/releases) — there's one build per architecture, so pick the one that matches your Mac:
+
+| Your Mac                        | Download                            |
+| ------------------------------- | ----------------------------------- |
+| **Apple Silicon** (M1/M2/M3/M4) | `Owlet-<version>-apple-silicon.dmg` |
+| **Intel**                       | `Owlet-<version>-intel.dmg`         |
+
+Not sure which you have? Open > About This Mac and look at **Chip** (Apple Silicon) versus **Processor** (Intel).
+
+Open the DMG and drag **Owlet.app** into your Applications folder, then launch it — the owl appears in your menu bar. If macOS says the app is damaged, it's an unsigned build being blocked by Gatekeeper; see [Running an unsigned (ad-hoc) build](#running-an-unsigned-ad-hoc-build).
+
 ## Requirements
 
 - macOS 13 (Ventura) or later
@@ -44,6 +57,25 @@ Two features are **signing-gated**: the unattended **privileged helper** and
 falls back to the admin-password prompt and auto-update stays inert — they only work
 for end users when you ship signed, notarized builds. The Sparkle EdDSA signing key
 is separate from Apple and is **free** in every case.
+
+### Running an unsigned (ad-hoc) build
+
+Builds without a Developer ID (the default CI output and local ad-hoc builds) are
+**ad-hoc signed but not notarized**. macOS adds a quarantine flag to anything you
+download, so double-clicking such a DMG's app can report:
+
+> "Owlet" is damaged and can't be opened. You should move it to the Trash.
+
+It isn't damaged — that's Gatekeeper refusing an un-notarized, quarantined app. To
+run it, remove the quarantine attribute after copying the app to Applications:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Owlet.app
+```
+
+Then open Owlet normally. (Building and running from Xcode on your own Mac never
+hits this, since local builds aren't quarantined.) The only way to remove this step
+for other users is a Developer ID-signed, notarized release — see below.
 
 ## Install / Build
 

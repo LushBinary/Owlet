@@ -4,9 +4,10 @@ name: Build DMG
 #
 # The pipeline degrades gracefully depending on which secrets are configured:
 #
-#  - No signing secrets (default): builds UNSIGNED DMGs. Pushes to main upload
-#    them as workflow-run artifacts; tags publish them to a GitHub *prerelease*
-#    (Gatekeeper will warn users; the helper + auto-update stay inert).
+#  - No signing secrets (default): builds AD-HOC signed DMGs. Pushes to main
+#    upload them as workflow-run artifacts; tags publish them to a GitHub
+#    *prerelease*. Gatekeeper still blocks downloads (users must clear the
+#    quarantine attribute), and the helper + auto-update stay inert.
 #  - Signing secrets present: builds Developer ID-SIGNED DMGs, and on a tag also
 #    notarizes + staples them, generates a Sparkle-signed appcast, and publishes
 #    everything to a GitHub Release. This is what makes the privileged helper
@@ -110,8 +111,13 @@ jobs:
             OTHER_CODE_SIGN_FLAGS="--timestamp" \
             clean build
 
-      # ---- Unsigned path (default, no secrets required) ----
-      - name: Build Owlet (Release, unsigned, ${{ matrix.arch }})
+      # ---- Ad-hoc signed path (default, no secrets required) ----
+      # Ad-hoc signing (identity "-") seals the app, Sparkle.framework, and the
+      # helper with a valid signature. This is NOT Developer ID and won't pass
+      # Gatekeeper on download, but — unlike a fully unsigned bundle — the app
+      # runs on Apple Silicon once the user removes the quarantine attribute
+      # (see the release notes). Without it, macOS reports the app as "damaged".
+      - name: Build Owlet (Release, ad-hoc signed, ${{ matrix.arch }})
         if: env.HAS_SIGNING != 'true'
         run: |
           set -euo pipefail
@@ -127,7 +133,7 @@ jobs:
             CODE_SIGN_IDENTITY="-" \
             CODE_SIGN_STYLE=Manual \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_ALLOWED=YES \
             DEVELOPMENT_TEAM="" \
             clean build
 
@@ -268,7 +274,7 @@ jobs:
           # Unsigned builds are marked as prereleases so they don't become the
           # "latest" release that the Sparkle feed URL resolves to.
           prerelease: ${{ env.HAS_SIGNING != 'true' }}
-          body: ${{ env.HAS_SIGNING == 'true' && 'Signed and notarized build.' || 'Unsigned build — macOS Gatekeeper will warn. Right-click the app and choose Open (or approve it in System Settings > Privacy & Security) to run it. The background helper and auto-update require a signed release.' }}
+          body: ${{ env.HAS_SIGNING == 'true' && 'Signed and notarized build. Drag Owlet to Applications and open it normally.' || 'Ad-hoc signed build (not notarized). macOS quarantines downloads, so Gatekeeper may report Owlet as damaged — it is not damaged. To run it, drag Owlet to Applications, then in Terminal run `xattr -dr com.apple.quarantine /Applications/Owlet.app` and open Owlet. The background helper and auto-update require a signed, notarized release (Developer ID).' }}
           files: dist/*.dmg
 
       - name: Attach appcast (signed releases only)
