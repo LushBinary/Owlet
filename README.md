@@ -31,7 +31,7 @@ Grab the latest DMG from the [Owlet releases page](https://github.com/LushBinary
 | **Apple Silicon** (M1/M2/M3/M4) | `Owlet-<version>-apple-silicon.dmg` |
 | **Intel**                       | `Owlet-<version>-intel.dmg`         |
 
-Not sure which you have? Open > About This Mac and look at **Chip** (Apple Silicon) versus **Processor** (Intel).
+Not sure which you have? Open the Apple menu > About This Mac and look for **Chip** (Apple Silicon) versus **Processor** (Intel).
 
 Open the DMG and drag **Owlet.app** into your Applications folder, then launch it — the owl appears in your menu bar. If macOS says the app is damaged, it's an unsigned build being blocked by Gatekeeper; see [Running an unsigned (ad-hoc) build](#running-an-unsigned-ad-hoc-build).
 
@@ -173,15 +173,21 @@ XML file) that lists versions and points at DMGs, both hosted on GitHub Releases
 
 **One-time setup:**
 
-1. **Generate an EdDSA key pair** with Sparkle's `generate_keys` tool (found in the
-   resolved Sparkle package under `.../artifacts/sparkle/Sparkle/bin/`):
+1. **Generate an EdDSA key pair** with Sparkle's `generate_keys` tool. It ships
+   inside the resolved Sparkle package; locate and run it with:
 
    ```bash
-   ./bin/generate_keys
+   # resolve packages first if you haven't opened the project yet:
+   # xcodebuild -project Owlet.xcodeproj -resolvePackageDependencies
+   GEN="$(find ~/Library/Developer/Xcode/DerivedData -name generate_keys -path '*Sparkle*' 2>/dev/null | head -1)"
+   "$GEN"
    ```
 
-   This stores the **private** key in your login keychain and prints the **public**
-   key. It also supports `-x private_key_file` to export the private key for CI.
+   Approve the keychain prompt. This stores the **private** key in your login
+   keychain and prints the **public** key (safe to commit). To export the private
+   key for backup / the CI secret, write it to a file with `"$GEN" -x sparkle_private_key.txt`
+   (the file is the base64 private seed — treat it like a password and delete it
+   after storing it safely).
 
 2. **Paste the public key** into `Owlet/Info.plist` under `SUPublicEDKey`
    (replace the `REPLACE_WITH_YOUR_SPARKLE_ED25519_PUBLIC_KEY` placeholder).
