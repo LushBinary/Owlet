@@ -1,17 +1,20 @@
 name: Build DMG
 
-# Build distributable DMGs for both Apple Silicon (arm64) and Intel (x86_64).
+# Build a single universal (arm64 + x86_64) DMG.
 #
 # The pipeline degrades gracefully depending on which secrets are configured:
 #
-#  - No signing secrets (default): builds AD-HOC signed DMGs. Pushes to main
-#    upload them as workflow-run artifacts; tags publish them to a GitHub
+#  - No signing secrets (default): builds an AD-HOC signed DMG. Pushes to main
+#    upload it as a workflow-run artifact; tags publish it to a GitHub
 #    *prerelease*. Gatekeeper still blocks downloads (users must clear the
 #    quarantine attribute), and the helper + auto-update stay inert.
-#  - Signing secrets present: builds Developer ID-SIGNED DMGs, and on a tag also
-#    notarizes + staples them, generates a Sparkle-signed appcast, and publishes
+#  - Signing secrets present: builds a Developer ID-SIGNED DMG, and on a tag also
+#    notarizes + staples it, generates a Sparkle-signed appcast, and publishes
 #    everything to a GitHub Release. This is what makes the privileged helper
 #    (SMAppService) and Sparkle auto-update work for end users.
+#
+# A universal binary is used (not one DMG per arch) because Sparkle's appcast
+# cannot contain two archives with the same bundle version.
 #
 # Optional repository secrets (add them when you have a paid Apple Developer
 # account + Sparkle keys — the pipeline picks them up automatically):
@@ -36,20 +39,12 @@ permissions:
 
 jobs:
   build:
-    name: Build ${{ matrix.arch }} DMG
+    name: Build universal DMG
     runs-on: macos-15
     env:
       IS_RELEASE: ${{ startsWith(github.ref, 'refs/tags/v') }}
       # True only when a Developer ID cert secret is configured.
       HAS_SIGNING: ${{ secrets.DEVELOPER_ID_APPLICATION_CERT != '' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: arm64
-            label: apple-silicon
-          - arch: x86_64
-            label: intel
 
     steps:
       - name: Checkout
@@ -67,9 +62,7 @@ jobs:
           xcodebuild -version
 
       - name: Show build environment
-        run: |
-          xcodebuild -version
-          echo "arch=${{ matrix.arch }} release=$IS_RELEASE signing=$HAS_SIGNING"
+        run: echo "release=$IS_RELEASE signing=$HAS_SIGNING"
 
       # ---- Signed path (only when signing secrets are configured) ----
       - name: Import Developer ID certificate
@@ -92,7 +85,7 @@ jobs:
           security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
           rm -f "$RUNNER_TEMP/cert.p12"
 
-      - name: Build Owlet (Release, signed, ${{ matrix.arch }})
+      - name: Build Owlet (Release, signed, universal)
         if: env.HAS_SIGNING == 'true'
         run: |
           set -euo pipefail
@@ -102,8 +95,7 @@ jobs:
             -configuration Release \
             -derivedDataPath build \
             -destination 'generic/platform=macOS' \
-            ARCHS='${{ matrix.arch }}' \
-            VALID_ARCHS='${{ matrix.arch }}' \
+            ARCHS="arm64 x86_64" \
             ONLY_ACTIVE_ARCH=NO \
             CODE_SIGN_STYLE=Manual \
             CODE_SIGN_IDENTITY="Developer ID Application" \
@@ -117,7 +109,7 @@ jobs:
       # Gatekeeper on download, but — unlike a fully unsigned bundle — the app
       # runs on Apple Silicon once the user removes the quarantine attribute
       # (see the release notes). Without it, macOS reports the app as "damaged".
-      - name: Build Owlet (Release, ad-hoc signed, ${{ matrix.arch }})
+      - name: Build Owlet (Release, ad-hoc signed, universal)
         if: env.HAS_SIGNING != 'true'
         run: |
           set -euo pipefail
@@ -127,8 +119,7 @@ jobs:
             -configuration Release \
             -derivedDataPath build \
             -destination 'generic/platform=macOS' \
-            ARCHS='${{ matrix.arch }}' \
-            VALID_ARCHS='${{ matrix.arch }}' \
+            ARCHS="arm64 x86_64" \
             ONLY_ACTIVE_ARCH=NO \
             CODE_SIGN_IDENTITY="-" \
             CODE_SIGN_STYLE=Manual \
@@ -137,25 +128,21 @@ jobs:
             DEVELOPMENT_TEAM="" \
             clean build
 
-      - name: Verify built architecture
+      - name: Verify universal binary
         run: |
           set -euo pipefail
-          APP="build/Build/Products/Release/Owlet.app"
-          BIN="$APP/Contents/MacOS/Owlet"
-          echo "Binary architectures:"
-          lipo -archs "$BIN"
-          lipo -archs "$BIN" | grep -qw '${{ matrix.arch }}'
+          BIN="build/Build/Products/Release/Owlet.app/Contents/MacOS/Owlet"
+          echo "Architectures: $(lipo -archs "$BIN")"
+          lipo -archs "$BIN" | grep -qw arm64
+          lipo -archs "$BIN" | grep -qw x86_64
 
       - name: Verify signing (signed builds only)
         if: env.HAS_SIGNING == 'true'
         run: |
           set -euo pipefail
           APP="build/Build/Products/Release/Owlet.app"
-          echo "App signature:"
           codesign --verify --deep --strict --verbose=2 "$APP"
-          echo "Embedded helper signature:"
           codesign --verify --strict --verbose=2 "$APP/Contents/MacOS/OwletHelper"
-          echo "Sparkle framework signature:"
           codesign --verify --strict --verbose=2 "$APP/Contents/Frameworks/Sparkle.framework"
 
       - name: Read app version
@@ -171,10 +158,9 @@ jobs:
         run: |
           set -euo pipefail
           APP="build/Build/Products/Release/Owlet.app"
-          OUT="dist/Owlet-${{ steps.version.outputs.version }}-${{ matrix.label }}.dmg"
+          OUT="dist/Owlet-${{ steps.version.outputs.version }}-universal.dmg"
           mkdir -p dist
           bash scripts/make-dmg.sh "$APP" "$OUT" "Owlet ${{ steps.version.outputs.version }}"
-          echo "Artifacts:"
           ls -lh dist
 
       - name: Sign, notarize and staple DMG (signed releases only)
@@ -185,10 +171,8 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
-          OUT="dist/Owlet-${{ steps.version.outputs.version }}-${{ matrix.label }}.dmg"
-          # Sign the disk image itself with the same Developer ID identity.
+          OUT="dist/Owlet-${{ steps.version.outputs.version }}-universal.dmg"
           codesign --force --timestamp --sign "Developer ID Application" "$OUT"
-          # Notarize and wait for the result, then staple the ticket into the DMG.
           xcrun notarytool submit "$OUT" \
             --apple-id "$APPLE_ID" \
             --team-id "$APPLE_TEAM_ID" \
@@ -200,11 +184,11 @@ jobs:
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Owlet-${{ matrix.label }}-dmg
+          name: Owlet-dmg
           path: dist/*.dmg
           if-no-files-found: error
 
-  # ---- Tagged releases: publish DMGs (+ signed appcast when keys are present) ----
+  # ---- Tagged releases: publish the DMG (+ signed appcast when keys are present) ----
   release:
     name: Publish Release
     needs: build
@@ -224,14 +208,21 @@ jobs:
           XCODE="${LATEST:-/Applications/Xcode.app}"
           echo "Selecting $XCODE"
           sudo xcode-select -switch "$XCODE"
-          xcodebuild -version
 
-      - name: Download DMG artifacts
+      - name: Download DMG artifact
         uses: actions/download-artifact@v4
         with:
-          pattern: Owlet-*-dmg
-          merge-multiple: true
+          name: Owlet-dmg
           path: dist
+
+      # Publish the DMG first so it's always attached, even if appcast generation
+      # has a hiccup.
+      - name: Publish DMG to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: ${{ env.HAS_SIGNING != 'true' }}
+          body: ${{ env.HAS_SIGNING == 'true' && 'Signed and notarized universal build. Drag Owlet to Applications and open it normally.' || 'Ad-hoc signed universal build (not notarized). macOS quarantines downloads, so Gatekeeper may report Owlet as damaged — it is not damaged. To run it, drag Owlet to Applications, then in Terminal run `xattr -dr com.apple.quarantine /Applications/Owlet.app` and open Owlet. The background helper and auto-update require a signed, notarized release (Developer ID).' }}
+          files: dist/*.dmg
 
       # ---- Appcast (only when a Sparkle private key is configured) ----
       - name: Locate Sparkle tools
@@ -239,7 +230,6 @@ jobs:
         if: env.HAS_SPARKLE == 'true'
         run: |
           set -euo pipefail
-          # Resolve the exact pinned Sparkle version and find its bundled tools.
           xcodebuild -project Owlet.xcodeproj -resolvePackageDependencies \
             -clonedSourcePackagesDirPath spm
           GEN=$(find spm -type f -name generate_appcast | head -1)
@@ -267,17 +257,7 @@ jobs:
           echo "Generated appcast:"
           cat dist/appcast.xml
 
-      # ---- Publish ----
-      - name: Publish DMGs to GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          # Unsigned builds are marked as prereleases so they don't become the
-          # "latest" release that the Sparkle feed URL resolves to.
-          prerelease: ${{ env.HAS_SIGNING != 'true' }}
-          body: ${{ env.HAS_SIGNING == 'true' && 'Signed and notarized build. Drag Owlet to Applications and open it normally.' || 'Ad-hoc signed build (not notarized). macOS quarantines downloads, so Gatekeeper may report Owlet as damaged — it is not damaged. To run it, drag Owlet to Applications, then in Terminal run `xattr -dr com.apple.quarantine /Applications/Owlet.app` and open Owlet. The background helper and auto-update require a signed, notarized release (Developer ID).' }}
-          files: dist/*.dmg
-
-      - name: Attach appcast (signed releases only)
+      - name: Attach appcast to GitHub Release
         if: env.HAS_SPARKLE == 'true'
         uses: softprops/action-gh-release@v2
         with:

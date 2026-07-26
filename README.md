@@ -24,14 +24,7 @@ Owlet uses IOKit power assertions to block idle sleep (like the classic "caffein
 
 ## Download
 
-Grab the latest DMG from the [Owlet releases page](https://github.com/LushBinary/Owlet/releases) — there's one build per architecture, so pick the one that matches your Mac:
-
-| Your Mac                        | Download                            |
-| ------------------------------- | ----------------------------------- |
-| **Apple Silicon** (M1/M2/M3/M4) | `Owlet-<version>-apple-silicon.dmg` |
-| **Intel**                       | `Owlet-<version>-intel.dmg`         |
-
-Not sure which you have? Open the Apple menu > About This Mac and look for **Chip** (Apple Silicon) versus **Processor** (Intel).
+Grab the latest `Owlet-<version>-universal.dmg` from the [Owlet releases page](https://github.com/LushBinary/Owlet/releases). It's a **universal** build that runs on both Apple Silicon and Intel Macs — no need to pick an architecture.
 
 Open the DMG and drag **Owlet.app** into your Applications folder, then launch it — the owl appears in your menu bar. If macOS says the app is damaged, it's an unsigned build being blocked by Gatekeeper; see [Running an unsigned (ad-hoc) build](#running-an-unsigned-ad-hoc-build).
 
@@ -205,17 +198,20 @@ losing it means you can't sign future updates that existing users will accept.
 ## Continuous delivery, signing & notarization
 
 The **Build DMG** GitHub Actions workflow (`.github/workflows/release-dmg.yml`)
-builds two architecture-specific disk images per run:
+builds a single **universal** (arm64 + x86_64) disk image per run:
 
-- `Owlet-<version>-apple-silicon.dmg` (arm64)
-- `Owlet-<version>-intel.dmg` (x86_64)
+- `Owlet-<version>-universal.dmg`
+
+(A universal binary is used rather than one DMG per architecture, because a
+Sparkle appcast can't contain two archives with the same bundle version.)
 
 Its behavior depends on what triggered it:
 
-- **Push to `main` / manual run** — builds **unsigned** DMGs (as before) and uploads
-  them as workflow-run artifacts. No secrets needed; Gatekeeper will warn users.
-- **Push a version tag (`vX.Y.Z`)** — builds **Developer ID-signed** DMGs, notarizes
-  and staples them, generates a **Sparkle-signed appcast**, and publishes the DMGs
+- **Push to `main` / manual run** — builds an **ad-hoc signed** DMG and uploads it
+  as a workflow-run artifact. No secrets needed; Gatekeeper still blocks the
+  download (see [Running an unsigned build](#running-an-unsigned-ad-hoc-build)).
+- **Push a version tag (`vX.Y.Z`)** — builds a **Developer ID-signed** DMG, notarizes
+  and staples it, generates a **Sparkle-signed appcast**, and publishes the DMG
   and `appcast.xml` to a GitHub Release:
 
   ```bash
@@ -249,12 +245,11 @@ scripts/make-dmg.sh build/Build/Products/Release/Owlet.app \
   dist/Owlet-1.0.dmg "Owlet 1.0"
 ```
 
-> **Note on architectures & the appcast.** Owlet ships one DMG per architecture.
-> Sparkle's `generate_appcast` detects each archive's CPU slices and tags the
-> arm64 build with `sparkle:hardwareRequirements`, so Apple Silicon and Intel
-> Macs each pick a compatible download from the same appcast. If you prefer to
-> remove any ambiguity, build a single **universal** (arm64 + x86_64) DMG for
-> releases instead — Owlet's binaries are tiny, so the size cost is negligible.
+> **Why universal, not per-architecture?** Sparkle's `generate_appcast` rejects an
+> appcast that contains two archives with the same bundle version (which two
+> same-version per-arch DMGs would be). A single universal binary sidesteps that
+> and keeps one download for everyone — and Owlet's binaries are tiny, so the size
+> cost is negligible.
 
 ## Releasing a new version
 
